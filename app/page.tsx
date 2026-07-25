@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useState, useEffect, ReactNode } from 'react';
+import React, { useState, useEffect, useRef, ReactNode } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import AccountCard from '@/components/AccountCard';
 import {
   BanknotesIcon,
   CreditCardIcon,
@@ -53,6 +54,16 @@ interface StatementItem {
 const formatCurrency = (amount: number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
+const getUSFormattedTime = () => {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  }).format(new Date());
+};
+
 const INITIAL_ACCOUNT: AccountData = {
   customerName: 'Frank R.',
   customerInitials: 'FR',
@@ -63,12 +74,12 @@ const INITIAL_ACCOUNT: AccountData = {
   checkingBalance: 6854200,
   savingsBalance: 248500,
   cardBalance: 12450,
-  lastSignIn: 'Today, 1:04 PM',
+  lastSignIn: 'Today, 5:59 PM EDT',
 };
 
 const INITIAL_TXNS: TransactionItem[] = [
-  { id: '1', title: 'ATM Withdrawal', category: 'Cash & ATM', date: 'Today, 10:14 AM', amount: 9900, type: 'debit' },
-  { id: '2', title: 'Salary Deposit', category: 'Payroll', date: 'Yesterday', amount: 120000, type: 'credit' },
+  { id: '1', title: 'ATM Withdrawal (incl. 10% fee)', category: 'Cash & ATM', date: 'Today, 10:14 AM EDT', amount: 9900, type: 'debit' },
+  { id: '2', title: 'Salary Deposit', category: 'Payroll', date: 'Jul 24, 2026', amount: 120000, type: 'credit' },
   { id: '3', title: 'Wire Transfer', category: 'Incoming Wire', date: 'Jul 20, 2026', amount: 75000, type: 'credit' },
   { id: '4', title: 'Card Purchase', category: 'Merchant', date: 'Jul 19, 2026', amount: 240, type: 'debit' },
 ];
@@ -85,7 +96,7 @@ export default function ChaseDashboard() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [account, setAccount] = useState(INITIAL_ACCOUNT);
   const [transactions, setTransactions] = useState(INITIAL_TXNS);
-  const [activeModal, setActiveModal] = useState<ActiveModal>(null);
+  const [activeModal, setActiveModal] = useState<ActiveModal>('deposit');
   const [notification, setNotification] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
@@ -95,12 +106,25 @@ export default function ChaseDashboard() {
   const [billPayee, setBillPayee] = useState('');
   const [depositAmount, setDepositAmount] = useState('');
 
-  // Auth guard
+  const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (notificationTimeoutRef.current) {
+        clearTimeout(notificationTimeoutRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     const authed = localStorage.getItem('chase_auth') === '1';
     if (!authed) {
       router.replace('/login');
     } else {
+      setAccount((prev) => ({
+        ...prev,
+        lastSignIn: `Today, ${getUSFormattedTime()}`,
+      }));
       setReady(true);
     }
   }, [router]);
@@ -112,24 +136,47 @@ export default function ChaseDashboard() {
   };
 
   const notify = (msg: string) => {
+    if (notificationTimeoutRef.current) {
+      clearTimeout(notificationTimeoutRef.current);
+    }
     setNotification(msg);
-    setTimeout(() => setNotification(null), 4000);
+    notificationTimeoutRef.current = setTimeout(() => {
+      setNotification(null);
+    }, 4000);
   };
 
   const handleTransfer = (e: React.FormEvent) => {
     e.preventDefault();
     const val = parseFloat(transferAmount);
-    if (isNaN(val) || val <= 0 || val > account.availableBalance) return;
+    if (isNaN(val) || val <= 0) return;
+
+    const fee = val * 0.10;
+    const totalDeduction = val + fee;
+
+    if (totalDeduction > account.availableBalance) {
+      notify(`Insufficient funds. Total cost with 10% fee: ${formatCurrency(totalDeduction)}`);
+      return;
+    }
+
     setAccount((p) => ({
       ...p,
-      availableBalance: p.availableBalance - val,
-      checkingBalance: p.checkingBalance - val,
+      availableBalance: p.availableBalance - totalDeduction,
+      checkingBalance: p.checkingBalance - totalDeduction,
     }));
+
     setTransactions((p) => [
-      { id: `tx-${Date.now()}`, title: `Transfer to ${transferRecipient || 'Recipient'}`, category: 'Transfer', date: 'Just now', amount: val, type: 'debit' },
+      {
+        id: `tx-${Date.now()}`,
+        title: `Transfer to ${transferRecipient || 'Recipient'} (incl. 10% fee)`,
+        category: 'Transfer',
+        date: 'Just now',
+        amount: totalDeduction,
+        type: 'debit',
+      },
       ...p,
     ]);
-    notify(`Transferred ${formatCurrency(val)}`);
+
+    notify(`Transferred ${formatCurrency(val)} (+ ${formatCurrency(fee)} fee)`);
     setTransferAmount('');
     setTransferRecipient('');
     setActiveModal(null);
@@ -174,24 +221,41 @@ export default function ChaseDashboard() {
 
   const downloadStatement = (stmt: StatementItem) => {
     setDownloadingId(stmt.id);
+
     setTimeout(() => {
-      const content = `Chase Statement - ${stmt.monthYear}\nCustomer: ${account.customerName}\nBalance: ${formatCurrency(account.availableBalance)}\n`;
+      const content = `Statement: ${stmt.monthYear}
+Customer: ${account.customerName}
+Balance: ${formatCurrency(account.availableBalance)}
+`;
+
       const blob = new Blob([content], { type: 'text/plain' });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = stmt.fileName;
-      a.click();
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = stmt.fileName;
+
+      document.body.appendChild(link);
+      link.click();
+
+      document.body.removeChild(link);
       URL.revokeObjectURL(url);
+
       setDownloadingId(null);
       notify(`Downloaded ${stmt.monthYear}`);
     }, 700);
   };
 
+  const parsedTransferAmount = parseFloat(transferAmount) || 0;
+  const calculatedFee = parsedTransferAmount * 0.10;
+  const maxAllowedTransfer = account.availableBalance / 1.10;
+
   if (!ready) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#f5f7fa]">
-        <p className="text-sm text-slate-500">Loading…</p>
+        <div className="flex items-center gap-2 text-slate-500">
+          <ArrowPathIcon className="h-5 w-5 animate-spin text-[#117ACA]" />
+          <p className="text-sm font-medium">Loading session…</p>
+        </div>
       </div>
     );
   }
@@ -200,7 +264,7 @@ export default function ChaseDashboard() {
     <div className="relative min-h-screen bg-[#f5f7fa] font-sans text-slate-900 antialiased">
       {notification && (
         <div className="fixed top-4 right-4 z-50 flex max-w-[90vw] items-center gap-3 rounded-lg bg-slate-900 px-4 py-3 text-white shadow-xl sm:px-5 sm:py-3.5">
-          <CheckCircleIcon className="h-5 w-5 text-emerald-400 shrink-0" />
+          <CheckCircleIcon className="h-5 w-5 shrink-0 text-emerald-400" />
           <p className="text-sm font-medium">{notification}</p>
         </div>
       )}
@@ -210,11 +274,19 @@ export default function ChaseDashboard() {
         <div className="mx-auto flex max-w-7xl items-center justify-between px-3 py-1.5 sm:px-6 lg:px-8">
           <span>Chase Online</span>
           <div className="flex items-center gap-3 sm:gap-5">
-            <button type="button" onClick={() => setActiveModal('support')} className="flex items-center gap-1 hover:text-white">
+            <button
+              type="button"
+              onClick={() => setActiveModal('support')}
+              className="flex items-center gap-1.5 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/50"
+            >
               <QuestionMarkCircleIcon className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Customer service</span>
             </button>
-            <button type="button" onClick={() => setActiveModal('alerts')} className="flex items-center gap-1 hover:text-white">
+            <button
+              type="button"
+              onClick={() => setActiveModal('alerts')}
+              className="flex items-center gap-1.5 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/50"
+            >
               <BellIcon className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Alerts</span>
             </button>
@@ -223,52 +295,57 @@ export default function ChaseDashboard() {
       </div>
 
       {/* Header */}
-      <header className="sticky top-0 z-40 border-b border-blue-900 bg-[#117ACA] shadow-sm">
+      <header className="sticky top-0 z-40 border-b border-blue-900/40 bg-[#117ACA] shadow-sm">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-3 sm:px-6 lg:px-8">
-          <div className="flex items-center gap-4 sm:gap-6">
-            <Link href="/" className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded bg-white">
-                <div className="h-4 w-4 rotate-45 border-2 border-[#117ACA]" />
+          <div className="flex items-center gap-6">
+            <Link href="/" className="flex items-center gap-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">
+              <div className="flex h-8 w-8 items-center justify-center rounded bg-white shadow-sm">
+                <div className="h-4 w-4 rotate-45 border-[2.5px] border-[#117ACA]" />
               </div>
-              <span className="text-lg font-bold tracking-[0.12em] text-white sm:text-xl">CHASE</span>
+              <span className="text-lg font-bold tracking-[0.14em] text-white sm:text-xl">CHASE</span>
             </Link>
             <nav className="hidden items-center gap-1 text-sm font-medium text-blue-50 lg:flex">
-              <Link href="/" className="rounded bg-white/15 px-3 py-1.5 text-white">Accounts</Link>
-              <Link href="/transfers" className="rounded px-3 py-1.5 hover:bg-white/10 hover:text-white">Pay &amp; transfer</Link>
-              <Link href="/cards" className="rounded px-3 py-1.5 hover:bg-white/10 hover:text-white">Credit cards</Link>
+              <Link href="/" className="rounded-lg bg-white/15 px-3.5 py-1.5 font-semibold text-white">Accounts</Link>
+              <Link href="/transfers" className="rounded-lg px-3.5 py-1.5 transition-colors hover:bg-white/10 hover:text-white">Pay &amp; transfer</Link>
+              <Link href="/cards" className="rounded-lg px-3.5 py-1.5 transition-colors hover:bg-white/10 hover:text-white">Credit cards</Link>
             </nav>
           </div>
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-3">
             <div className="hidden text-right text-white sm:block">
               <p className="text-sm font-semibold leading-tight">{account.customerName}</p>
               <p className="text-[11px] text-blue-100">{account.tier}</p>
             </div>
-            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white text-sm font-bold text-[#117ACA]">
+            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white text-sm font-bold text-[#117ACA] shadow-sm">
               {account.customerInitials}
             </div>
             <button
               type="button"
               onClick={handleSignOut}
-              className="hidden rounded p-1.5 text-blue-50 hover:bg-white/10 sm:inline-flex"
+              className="hidden rounded-lg p-1.5 text-blue-50 transition-colors hover:bg-white/10 sm:inline-flex"
               title="Sign out"
             >
               <ArrowRightOnRectangleIcon className="h-5 w-5" />
             </button>
-            <button type="button" className="rounded p-1.5 text-blue-50 hover:bg-white/10 lg:hidden" onClick={() => setMobileMenuOpen(!mobileMenuOpen)}>
+            <button
+              type="button"
+              className="rounded-lg p-1.5 text-blue-50 transition-colors hover:bg-white/10 lg:hidden"
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            >
               {mobileMenuOpen ? <XMarkIcon className="h-6 w-6" /> : <Bars3Icon className="h-6 w-6" />}
             </button>
           </div>
         </div>
+
         {mobileMenuOpen && (
-          <div className="border-t border-blue-600 bg-[#0e6bb5] px-3 py-3 lg:hidden">
+          <div className="border-t border-blue-600/50 bg-[#0e6bb5] px-3 py-3 lg:hidden">
             <nav className="flex flex-col gap-1 text-sm font-medium text-white">
-              <Link href="/" className="rounded px-3 py-2 bg-white/15" onClick={() => setMobileMenuOpen(false)}>Accounts</Link>
-              <Link href="/transfers" className="rounded px-3 py-2 hover:bg-white/10" onClick={() => setMobileMenuOpen(false)}>Pay &amp; transfer</Link>
-              <Link href="/cards" className="rounded px-3 py-2 hover:bg-white/10" onClick={() => setMobileMenuOpen(false)}>Credit cards</Link>
+              <Link href="/" className="rounded-md bg-white/15 px-3 py-2" onClick={() => setMobileMenuOpen(false)}>Accounts</Link>
+              <Link href="/transfers" className="rounded-md px-3 py-2 transition-colors hover:bg-white/10" onClick={() => setMobileMenuOpen(false)}>Pay &amp; transfer</Link>
+              <Link href="/cards" className="rounded-md px-3 py-2 transition-colors hover:bg-white/10" onClick={() => setMobileMenuOpen(false)}>Credit cards</Link>
               <button
                 type="button"
                 onClick={() => { setMobileMenuOpen(false); handleSignOut(); }}
-                className="rounded px-3 py-2 text-left hover:bg-white/10"
+                className="rounded-md px-3 py-2 text-left transition-colors hover:bg-white/10"
               >
                 Sign out
               </button>
@@ -277,16 +354,17 @@ export default function ChaseDashboard() {
         )}
       </header>
 
-      <main className="mx-auto max-w-7xl px-3 py-5 sm:px-6 sm:py-6 lg:px-8">
-        <div className="mb-5 sm:mb-6">
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl">
+      <main className="mx-auto max-w-7xl px-3 py-6 sm:px-6 sm:py-8 lg:px-8">
+        {/* Welcome Banner */}
+        <div className="mb-6 sm:mb-8">
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
             Good afternoon, {account.customerName.split(' ')[0]}
           </h1>
-          <p className="mt-0.5 text-xs text-slate-500 sm:text-sm">Last sign-in: {account.lastSignIn}</p>
+          <p className="mt-1 text-xs text-slate-500 sm:text-sm">Last sign-in: {account.lastSignIn}</p>
         </div>
 
-        {/* Account cards */}
-        <section className="mb-6 grid gap-3 sm:mb-8 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">
+        {/* Modular Account Cards */}
+        <section className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <AccountCard
             icon={<BanknotesIcon className="h-5 w-5" />}
             iconBg="bg-[#117ACA]"
@@ -295,6 +373,7 @@ export default function ChaseDashboard() {
             label="Available balance"
             balance={account.checkingBalance}
             footer="Present balance same"
+            formatCurrency={formatCurrency}
             onActivity={() => setActiveModal('statements')}
           />
           <AccountCard
@@ -305,6 +384,7 @@ export default function ChaseDashboard() {
             label="Available balance"
             balance={account.savingsBalance}
             footer="APY 0.01%"
+            formatCurrency={formatCurrency}
           />
           <AccountCard
             icon={<CreditCardIcon className="h-5 w-5" />}
@@ -314,13 +394,14 @@ export default function ChaseDashboard() {
             label="Current balance"
             balance={account.cardBalance}
             footer={`Available credit ${formatCurrency(15000 - account.cardBalance)}`}
+            formatCurrency={formatCurrency}
           />
         </section>
 
         {/* Quick actions */}
-        <section className="mb-6 sm:mb-8">
-          <h2 className="mb-3 text-base font-semibold text-slate-900">Quick actions</h2>
-          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 sm:gap-3">
+        <section className="mb-8">
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-slate-500">Quick actions</h2>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
             <ActionBtn title="Transfer" icon={<ArrowsRightLeftIcon className="h-5 w-5" />} onClick={() => setActiveModal('transfer')} />
             <ActionBtn title="Pay bills" icon={<DocumentTextIcon className="h-5 w-5" />} onClick={() => setActiveModal('pay')} />
             <ActionBtn title="Deposit" icon={<BanknotesIcon className="h-5 w-5" />} onClick={() => setActiveModal('deposit')} />
@@ -329,21 +410,25 @@ export default function ChaseDashboard() {
         </section>
 
         {/* Recent activity */}
-        <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-          <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3.5 sm:px-5 sm:py-4">
-            <h2 className="text-base font-semibold text-slate-900">Recent activity</h2>
-            <button type="button" onClick={() => setActiveModal('statements')} className="text-sm font-semibold text-[#117ACA] hover:underline">
+        <section className="overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-sm">
+          <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+            <h2 className="text-base font-semibold tracking-tight text-slate-900">Recent activity</h2>
+            <button
+              type="button"
+              onClick={() => setActiveModal('statements')}
+              className="text-xs font-semibold text-[#117ACA] transition-colors hover:text-[#0d5f9e] hover:underline"
+            >
               See all
             </button>
           </div>
           <div className="divide-y divide-slate-100">
             {transactions.map((tx) => (
-              <div key={tx.id} className="flex items-center justify-between px-4 py-3 sm:px-5 sm:py-3.5 hover:bg-slate-50">
-                <div className="min-w-0 pr-3">
+              <div key={tx.id} className="flex items-center justify-between px-5 py-3.5 transition-colors hover:bg-slate-50/80">
+                <div className="min-w-0 pr-4">
                   <p className="truncate text-sm font-medium text-slate-900">{tx.title}</p>
                   <p className="text-xs text-slate-500">{tx.category} · {tx.date}</p>
                 </div>
-                <p className={`shrink-0 text-sm font-semibold ${tx.type === 'debit' ? 'text-slate-900' : 'text-emerald-600'}`}>
+                <p className={`shrink-0 text-sm font-bold tabular-nums ${tx.type === 'debit' ? 'text-slate-900' : 'text-emerald-600'}`}>
                   {tx.type === 'debit' ? '−' : '+'}{formatCurrency(tx.amount)}
                 </p>
               </div>
@@ -352,11 +437,11 @@ export default function ChaseDashboard() {
         </section>
       </main>
 
-      {/* Modals */}
+      {/* Action Modals */}
       {activeModal && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 sm:items-center sm:p-4">
-          <div className="w-full max-w-md rounded-t-2xl bg-white shadow-2xl sm:rounded-xl">
-            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/60 p-0 backdrop-blur-sm sm:items-center sm:p-4">
+          <div className="w-full max-w-md rounded-t-2xl bg-white shadow-2xl sm:rounded-2xl">
+            <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
               <h3 className="text-base font-semibold text-slate-900">
                 {activeModal === 'transfer' && 'Transfer money'}
                 {activeModal === 'pay' && 'Pay bills'}
@@ -365,61 +450,161 @@ export default function ChaseDashboard() {
                 {activeModal === 'alerts' && 'Alerts'}
                 {activeModal === 'support' && 'Customer service'}
               </h3>
-              <button type="button" onClick={() => setActiveModal(null)} className="rounded p-1 text-slate-400 hover:bg-slate-100">
-                <XCircleIcon className="h-5 w-5" />
+              <button
+                type="button"
+                onClick={() => setActiveModal(null)}
+                className="rounded-lg p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+              >
+                <XCircleIcon className="h-6 w-6" />
               </button>
             </div>
-            <div className="max-h-[70vh] overflow-y-auto p-5">
+            <div className="max-h-[70vh] overflow-y-auto p-6">
               {activeModal === 'transfer' && (
-                <form onSubmit={handleTransfer} className="space-y-4">
+                <form onSubmit={handleTransfer} className="space-y-5">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-600">To</label>
-                    <input type="text" required placeholder="Name or account" value={transferRecipient} onChange={(e) => setTransferRecipient(e.target.value)} className="mt-1.5 w-full rounded-md border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20" />
+                    <label htmlFor="transfer-recipient" className="block text-sm font-semibold text-slate-900">
+                      Transfer to
+                    </label>
+                    <p id="recipient-hint" className="mt-1 text-xs text-slate-500">
+                      Enter recipient name, email, or account number.
+                    </p>
+                    <input
+                      id="transfer-recipient"
+                      type="text"
+                      required
+                      aria-describedby="recipient-hint"
+                      value={transferRecipient}
+                      onChange={(e) => setTransferRecipient(e.target.value)}
+                      placeholder="Recipient name or account"
+                      className="mt-2 w-full rounded-xl border border-slate-300 px-4 py-2.5 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20"
+                    />
                   </div>
+
                   <div>
-                    <label className="block text-xs font-semibold text-slate-600">Amount</label>
-                    <input type="number" step="0.01" required placeholder="0.00" value={transferAmount} onChange={(e) => setTransferAmount(e.target.value)} className="mt-1.5 w-full rounded-md border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20" />
+                    <div className="flex items-center justify-between">
+                      <label htmlFor="transfer-amount" className="text-sm font-semibold text-slate-900">
+                        Amount
+                      </label>
+                      <span className="text-xs text-slate-500">
+                        Available: <strong className="ml-1 text-slate-900">{formatCurrency(account.availableBalance)}</strong>
+                      </span>
+                    </div>
+
+                    <div className="relative mt-2">
+                      <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-semibold text-slate-400">$</span>
+                      <input
+                        id="transfer-amount"
+                        type="number"
+                        required
+                        min={0.01}
+                        max={maxAllowedTransfer}
+                        step="0.01"
+                        value={transferAmount}
+                        onChange={(e) => setTransferAmount(e.target.value)}
+                        placeholder="0.00"
+                        className="w-full rounded-xl border border-slate-300 py-2.5 pl-8 pr-4 text-sm font-medium text-slate-900 outline-none transition focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20"
+                      />
+                    </div>
                   </div>
-                  <button type="submit" className="w-full rounded-md bg-[#117ACA] py-2.5 text-sm font-semibold text-white hover:bg-[#0e6bb5]">Continue</button>
+
+                  <div className="rounded-xl border border-blue-100 bg-blue-50 p-4">
+                    <div className="flex gap-3">
+                      <ArrowsRightLeftIcon className="h-5 w-5 shrink-0 text-[#117ACA]" />
+                      <div className="space-y-1 text-xs">
+                        <p className="text-sm font-semibold text-slate-900">Transfer Summary</p>
+                        <div className="flex justify-between text-slate-600">
+                          <span>Transfer amount:</span>
+                          <span className="font-medium text-slate-900">{formatCurrency(parsedTransferAmount)}</span>
+                        </div>
+                        <div className="flex justify-between text-slate-600">
+                          <span>Withdrawal fee (10%):</span>
+                          <span className="font-medium text-amber-700">+{formatCurrency(calculatedFee)}</span>
+                        </div>
+                        <div className="flex justify-between border-t border-blue-200/60 pt-1 font-semibold text-slate-900">
+                          <span>Total deduction:</span>
+                          <span>{formatCurrency(parsedTransferAmount + calculatedFee)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full rounded-xl bg-[#117ACA] py-3 text-sm font-semibold text-white transition hover:bg-[#0d5f9e] focus:ring-2 focus:ring-[#117ACA]"
+                  >
+                    Review transfer
+                  </button>
                 </form>
               )}
               {activeModal === 'pay' && (
                 <form onSubmit={handleBillPay} className="space-y-4">
                   <div>
                     <label className="block text-xs font-semibold text-slate-600">Payee</label>
-                    <input type="text" required placeholder="Biller name" value={billPayee} onChange={(e) => setBillPayee(e.target.value)} className="mt-1.5 w-full rounded-md border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20" />
+                    <input
+                      type="text"
+                      required
+                      placeholder="Biller name"
+                      value={billPayee}
+                      onChange={(e) => setBillPayee(e.target.value)}
+                      className="mt-1.5 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none transition focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20"
+                    />
                   </div>
                   <div>
                     <label className="block text-xs font-semibold text-slate-600">Amount</label>
-                    <input type="number" step="0.01" required placeholder="0.00" value={billAmount} onChange={(e) => setBillAmount(e.target.value)} className="mt-1.5 w-full rounded-md border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20" />
+                    <input
+                      type="number"
+                      step="0.01"
+                      required
+                      placeholder="0.00"
+                      value={billAmount}
+                      onChange={(e) => setBillAmount(e.target.value)}
+                      className="mt-1.5 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none transition focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20"
+                    />
                   </div>
-                  <button type="submit" className="w-full rounded-md bg-[#117ACA] py-2.5 text-sm font-semibold text-white hover:bg-[#0e6bb5]">Pay</button>
+                  <button type="submit" className="w-full rounded-xl bg-[#117ACA] py-3 text-sm font-semibold text-white transition hover:bg-[#0d5f9e]">
+                    Pay
+                  </button>
                 </form>
               )}
               {activeModal === 'deposit' && (
                 <form onSubmit={handleDeposit} className="space-y-4">
                   <div>
                     <label className="block text-xs font-semibold text-slate-600">Check amount</label>
-                    <input type="number" step="0.01" required placeholder="0.00" value={depositAmount} onChange={(e) => setDepositAmount(e.target.value)} className="mt-1.5 w-full rounded-md border border-slate-300 px-3.5 py-2.5 text-sm outline-none focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20" />
+                    <input
+                      type="number"
+                      step="0.01"
+                      required
+                      placeholder="0.00"
+                      value={depositAmount}
+                      onChange={(e) => setDepositAmount(e.target.value)}
+                      className="mt-1.5 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm outline-none transition focus:border-[#117ACA] focus:ring-2 focus:ring-[#117ACA]/20"
+                    />
                   </div>
-                  <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 py-8 text-center">
+                  <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 py-8 text-center">
                     <BanknotesIcon className="mx-auto h-8 w-8 text-slate-400" />
-                    <p className="mt-2 text-sm font-medium text-slate-600">Capture front &amp; back of check</p>
+                    <p className="mt-2 text-xs font-medium text-slate-600">Capture front &amp; back of check</p>
                   </div>
-                  <button type="submit" className="w-full rounded-md bg-[#117ACA] py-2.5 text-sm font-semibold text-white hover:bg-[#0e6bb5]">Deposit</button>
+                  <button type="submit" className="w-full rounded-xl bg-[#117ACA] py-3 text-sm font-semibold text-white transition hover:bg-[#0d5f9e]">
+                    Deposit
+                  </button>
                 </form>
               )}
               {activeModal === 'statements' && (
                 <div className="space-y-2">
                   {STATEMENTS.map((stmt) => (
-                    <div key={stmt.id} className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3">
+                    <div key={stmt.id} className="flex items-center justify-between rounded-xl border border-slate-200 p-4 transition-colors hover:bg-slate-50/80">
                       <div>
                         <p className="text-sm font-semibold text-slate-900">{stmt.monthYear}</p>
                         <p className="text-xs text-slate-500">{stmt.period}</p>
                       </div>
-                      <button type="button" disabled={downloadingId === stmt.id} onClick={() => downloadStatement(stmt)} className="text-sm font-semibold text-[#117ACA] hover:underline disabled:opacity-50">
+                      <button
+                        type="button"
+                        disabled={downloadingId === stmt.id}
+                        onClick={() => downloadStatement(stmt)}
+                        className="text-xs font-semibold text-[#117ACA] hover:underline disabled:opacity-50"
+                      >
                         {downloadingId === stmt.id ? (
-                          <span className="inline-flex items-center gap-1"><ArrowPathIcon className="h-4 w-4 animate-spin" />Downloading…</span>
+                          <span className="inline-flex items-center gap-1.5"><ArrowPathIcon className="h-4 w-4 animate-spin" />Downloading…</span>
                         ) : 'Download'}
                       </button>
                     </div>
@@ -427,16 +612,24 @@ export default function ChaseDashboard() {
                 </div>
               )}
               {activeModal === 'alerts' && (
-                <div className="rounded-lg bg-blue-50 p-4 text-sm text-slate-700">
+                <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-4 text-sm text-slate-700">
                   <p className="font-semibold text-[#117ACA]">Account security status: Normal</p>
-                  <p className="mt-1 text-xs">Two-step verification is on.</p>
+                  <p className="mt-1 text-xs text-slate-600">Two-step verification is enabled across all recognized devices.</p>
                 </div>
               )}
               {activeModal === 'support' && (
-                <div className="space-y-3 text-sm text-slate-600">
-                  <p><strong>Private Client line:</strong> 1-888-393-2000</p>
-                  <p><strong>Your advisor:</strong> Sarah Jenkins</p>
-                  <button type="button" onClick={() => { setActiveModal(null); notify('Callback request submitted.'); }} className="mt-2 w-full rounded-md bg-[#117ACA] py-2.5 text-sm font-semibold text-white hover:bg-[#0e6bb5]">
+                <div className="space-y-4 text-sm text-slate-600">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-xs text-slate-500">Private Client Dedicated Line</p>
+                    <p className="text-base font-semibold text-slate-900">1-888-393-2000</p>
+                    <p className="mt-2 text-xs text-slate-500">Your Advisor</p>
+                    <p className="text-sm font-medium text-slate-800">Sarah Jenkins</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveModal(null); notify('Callback request submitted.'); }}
+                    className="w-full rounded-xl bg-[#117ACA] py-3 text-sm font-semibold text-white transition hover:bg-[#0d5f9e]"
+                  >
                     Request a callback
                   </button>
                 </div>
@@ -446,14 +639,15 @@ export default function ChaseDashboard() {
         </div>
       )}
 
-      <footer className="mt-10 border-t border-slate-200 bg-white py-5 text-xs text-slate-500 sm:mt-12 sm:py-6">
-        <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-3 px-4 sm:flex-row sm:px-6 lg:px-8">
+      {/* Footer */}
+      <footer className="mt-12 border-t border-slate-200 bg-white py-6 text-xs text-slate-500">
+        <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-4 px-4 sm:flex-row sm:px-6 lg:px-8">
           <p>© 2026 JPMorgan Chase &amp; Co.</p>
-          <div className="flex flex-wrap justify-center gap-4 sm:gap-5">
-            <button type="button" className="hover:underline">Privacy</button>
-            <button type="button" className="hover:underline">Security</button>
-            <button type="button" className="hover:underline">Terms of use</button>
-            <span>Member FDIC</span>
+          <div className="flex flex-wrap justify-center gap-5">
+            <button type="button" className="transition-colors hover:text-slate-900 hover:underline">Privacy</button>
+            <button type="button" className="transition-colors hover:text-slate-900 hover:underline">Security</button>
+            <button type="button" className="transition-colors hover:text-slate-900 hover:underline">Terms of use</button>
+            <span className="font-medium text-slate-400">Member FDIC</span>
           </div>
         </div>
       </footer>
@@ -461,39 +655,16 @@ export default function ChaseDashboard() {
   );
 }
 
-function AccountCard({
-  icon, iconBg, title, number, label, balance, footer, onActivity,
-}: {
-  icon: ReactNode; iconBg: string; title: string; number: string; label: string; balance: number; footer: string; onActivity?: () => void;
-}) {
-  return (
-    <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex items-center gap-3">
-        <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white sm:h-10 sm:w-10 ${iconBg}`}>{icon}</div>
-        <div className="min-w-0">
-          <h3 className="truncate text-sm font-semibold text-slate-900">{title}</h3>
-          <p className="text-xs text-slate-500">{number}</p>
-        </div>
-      </div>
-      <div className="mt-3 sm:mt-4">
-        <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">{label}</p>
-        <p className="mt-0.5 text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{formatCurrency(balance)}</p>
-      </div>
-      <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-xs sm:mt-4">
-        <span className="text-slate-500">{footer}</span>
-        {onActivity && (
-          <button type="button" onClick={onActivity} className="font-semibold text-[#117ACA] hover:underline">View activity</button>
-        )}
-      </div>
-    </article>
-  );
-}
-
 function ActionBtn({ title, icon, onClick }: { title: string; icon: ReactNode; onClick: () => void }) {
   return (
-    <button type="button" onClick={onClick} className="flex flex-col items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-3.5 text-xs font-semibold text-slate-800 shadow-sm transition hover:border-[#117ACA] hover:text-[#117ACA] sm:gap-2 sm:px-3 sm:py-4 sm:text-sm">
-      <span className="text-[#117ACA]">{icon}</span>
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex flex-col items-center gap-2 rounded-2xl border border-slate-200/80 bg-white px-3 py-4 text-xs font-semibold text-slate-800 shadow-sm transition-all hover:-translate-y-0.5 hover:border-[#117ACA]/40 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#117ACA] sm:text-sm"
+    >
+      <span className="text-[#117ACA] transition-transform group-hover:scale-110">{icon}</span>
       {title}
     </button>
   );
 }
+
