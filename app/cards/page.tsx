@@ -9,7 +9,7 @@ import {
   LockOpenIcon,
   CheckCircleIcon,
   ArrowPathIcon,
-  BuildingBanknotesIcon,
+  BanknotesIcon,
   ShieldCheckIcon,
 } from '@heroicons/react/24/outline';
 
@@ -234,7 +234,7 @@ export default function CardsPage() {
                     </>
                   ) : (
                     <>
-                      <BuildingBanknotesIcon className="h-5 w-5" /> Submit Card Payment
+                      <BanknotesIcon className="h-5 w-5" /> Submit Card Payment
                     </>
                   )}
                 </button>
